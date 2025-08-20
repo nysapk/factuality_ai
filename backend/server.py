@@ -1,15 +1,20 @@
+import datetime
 import json
 import os
+import uuid
 from fastapi import FastAPI, APIRouter, HTTPException, logger
 from pathlib import Path
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
-
-ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+from typing import List, Optional, Dict, Any
+from pydantic import BaseModel, Field
 from youtube_transcript_api import YouTubeTranscriptApi
 import wikipediaapi
 from openai import OpenAI
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / '.env')
+
 
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
@@ -33,6 +38,43 @@ app = FastAPI(title="Factuality - Real-time Fact Checker")
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
+
+# Define Models
+class StatusCheck(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    client_name: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+class StatusCheckCreate(BaseModel):
+    client_name: str
+
+class YouTubeRequest(BaseModel):
+    url: str
+
+class Claim(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    text: str
+    timestamp: str
+    context: str
+    factual_status: str  # "true", "false", "partial", "unverified"
+    confidence_score: float
+    explanation: str
+    sources: List[str] = []
+
+class FactCheckResult(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    youtube_url: str
+    video_title: str
+    channel_name: str
+    transcript_length: int
+    claims: List[Claim]
+    processing_time: float
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    total_claims: int
+    true_claims: int
+    false_claims: int
+    partial_claims: int
+    unverified_claims: int
 
 async def search_wikipedia(query: str) -> List[str]:
     """Search Wikipedia for information related to a claim"""
