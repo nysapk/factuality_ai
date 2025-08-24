@@ -122,6 +122,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [error, setError] = useState("");
+  const [activeTab, setActiveTab] = useState("checker");
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -140,27 +141,55 @@ function App() {
     <div className="min-h-screen bg-gray-50">
       <Header />
       <div className="container mx-auto px-4 py-8">
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <input
-            type="url"
-            value={youtubeUrl}
-            onChange={(e) => setYoutubeUrl(e.target.value)}
-            placeholder="YouTube URL"
-            className="w-full border px-4 py-2 rounded"
-            disabled={loading}
-          />
-          <button type="submit" disabled={loading} className="px-6 py-2 bg-blue-600 text-white rounded">
-            {loading ? "Analyzing..." : "Analyze Video"}
+        <div className="flex space-x-4 mb-8">
+          <button
+            onClick={() => setActiveTab('checker')}
+            className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+              activeTab === 'checker'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white text-gray-700 hover:bg-blue-50'
+            }`}
+          >
+            🎯 Fact Checker
           </button>
-        </form>
-        {error && <div className="mt-2 text-red-600">{error}</div>}
+          <button
+            onClick={() => setActiveTab('dashboard')}
+            className={`px-6 py-3 rounded-lg font-medium transition-colors ${
+              activeTab === 'dashboard'
+                ? 'bg-blue-600 text-white'
+                : 'bg-white text-gray-700 hover:bg-blue-50'
+            }`}
+          >
+            📊 Dashboard
+          </button>
+        </div>
 
-        {result && (
+        {activeTab === 'checker' && (
           <>
-            <StatsSummary result={result} />
-            {result.claims.map((claim, idx) => <ClaimCard key={idx} claim={claim} />)}
+          <form onSubmit={handleSubmit} className="space-y-4">
+            <input
+              type="url"
+              value={youtubeUrl}
+              onChange={(e) => setYoutubeUrl(e.target.value)}
+              placeholder="YouTube URL"
+              className="w-full border px-4 py-2 rounded"
+              disabled={loading}
+            />
+              <button type="submit" disabled={loading} className="px-6 py-2 bg-blue-600 text-white rounded">
+                {loading ? "Analyzing..." : "Analyze Video"}
+              </button>
+          </form>
+
+            {result && <StatsSummary result={result} />}
+
+
+            {result && result.claims.map((claim, idx) => (
+              <ClaimCard key={idx} claim={claim} />
+            ))}
           </>
         )}
+
+        {activeTab === 'dashboard'}
       </div>
     </div>
   );
