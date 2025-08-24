@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import "./App.css";
 import axios from "axios";
 
@@ -117,6 +117,62 @@ const ClaimCard = ({ claim }) => {
   );
 };
 
+const OutrageousClaims = () => {
+  const [outrageousClaims, setOutrageousClaims] = useState([]);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => { fetchOutrageousClaims(); }, []);
+
+  const fetchOutrageousClaims = async () => {
+    setLoading(true);
+    try {
+      const response = await axios.get(`${API}/fact-check/outrageous-claims`);
+      setOutrageousClaims(response.data);
+    } catch (error) {
+      console.error('Error fetching outrageous claims:', error);
+    } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="bg-white rounded-lg shadow-md p-6">
+      <h3 className="text-xl font-semibold mb-4 text-red-700">🚨 Most Outrageous Claims</h3>
+
+      {loading && (
+        <div className="text-center py-8">
+          <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-red-600 mx-auto"></div>
+          <p className="text-gray-600 mt-2">Loading claims...</p>
+        </div>
+      )}
+
+      {!loading && outrageousClaims.length === 0 && (
+        <p className="text-gray-600 text-center py-8">
+          No outrageous claims found yet. Analyze some videos first!
+        </p>
+      )}
+
+      <div className="space-y-4">
+        {outrageousClaims.map((item, index) => (
+          <div key={index} className="border-l-4 border-red-500 bg-red-50 p-4 rounded-r-lg">
+            <div className="flex justify-between items-start mb-2">
+              <div className="text-sm text-gray-600">
+                <strong>{item.channel_name}</strong> • {item.video_title}
+              </div>
+              <div className="text-xs bg-red-600 text-white px-2 py-1 rounded">
+                {Math.round(item.claim.confidence_score * 100)}% False
+              </div>
+            </div>
+            <blockquote className="font-medium text-gray-900 mb-2">"{item.claim.text}"</blockquote>
+            <p className="text-sm text-gray-700">{item.claim.explanation}</p>
+            <div className="mt-2 text-xs text-gray-500">
+              Analyzed on {new Date(item.created_at).toLocaleDateString()}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 function App() {
   const [youtubeUrl, setYoutubeUrl] = useState("");
   const [loading, setLoading] = useState(false);
@@ -186,10 +242,19 @@ function App() {
             {result && result.claims.map((claim, idx) => (
               <ClaimCard key={idx} claim={claim} />
             ))}
+            {result && (
+              <button
+                type="button"
+                onClick={() => { setYoutubeUrl(""); setResult(null); setError(""); }}
+                className="px-6 py-3 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
+              >
+                New Analysis
+              </button>
+            )}
           </>
         )}
 
-        {activeTab === 'dashboard'}
+        {activeTab === 'dashboard' && <OutrageousClaims />}
       </div>
     </div>
   );
