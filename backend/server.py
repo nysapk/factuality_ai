@@ -111,6 +111,53 @@ async def get_youtube_transcript(video_id: str) -> Dict[str, Any]:
         ]
         return {"title": "Demo Video", "channel": "Demo Channel", "transcript": demo_transcript}
 
+def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
+    claims = []
+    full_text = " ".join([item["text"] for item in transcript])
+    if openai_client:
+        try:
+            resp = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Extract up to 10 factual claims from the transcript in JSON format.",
+                    },
+                    {"role": "user", "content": full_text},
+                ],
+                temperature=0.3,
+                max_tokens=1000,
+            )
+            content = resp.choices[0].message.content.strip()
+            extracted = json.loads(content)
+            for c in extracted:
+                claim = Claim(
+                    text=c.get("text", ""),
+                    timestamp=c.get("timestamp", "0:00"),
+                    context=c.get("context", ""),
+                    factual_status="unverified",
+                    confidence_score=0.0,
+                    explanation="Pending fact-check",
+                )
+                claims.append(claim)
+        except Exception as e:
+            logger.error(f"OpenAI claim extraction failed: {e}")
+
+    # fallback sample claims
+    if not claims:
+        for statement in transcript:
+            claims.append(
+                Claim(
+                    text=statement["text"],
+                    timestamp=str(statement.get("start", 0)),
+                    context="",
+                    factual_status="unverified",
+                    confidence_score=0.0,
+                    explanation="Pending fact-check",
+                )
+            )
+    return claims
+
 async def search_wikipedia(query: str) -> List[str]:
     """Search Wikipedia for information related to a claim"""
     try:
