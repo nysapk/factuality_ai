@@ -401,6 +401,16 @@ async def fact_check_youtube(request: YouTubeRequest):
     await db.fact_checks.insert_one(result.dict())
     return result
 
+@api_router.get("/fact-check/outrageous-claims")
+async def get_outrageous_claims():
+    claims = await db.fact_checks.find().to_list(100)
+    outrageous = []
+    for fc in claims:
+        for claim in fc["claims"]:
+            if claim["confidence_score"] < 0.3 or claim["factual_status"] == "false":
+                outrageous.append({"video_title": fc["video_title"], "channel_name": fc["channel_name"], "claim": claim, "created_at": fc["created_at"]})
+    return outrageous
+
 app.include_router(api_router)
 
 app.add_middleware(

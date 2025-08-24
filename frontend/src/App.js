@@ -271,9 +271,7 @@ function App() {
             )}
           </form>
 
-            {result && <StatsSummary result={result} />}
-
-
+          {result && <StatsSummary result={result} />}
             {result && result.claims.map((claim, idx) => (
               <ClaimCard key={idx} claim={claim} />
             ))}
