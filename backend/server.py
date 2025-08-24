@@ -116,17 +116,33 @@ async def get_youtube_transcript(video_id: str) -> Dict[str, Any]:
         ]
         return {"title": "Demo Video", "channel": "Demo Channel", "transcript": demo_transcript}
 
+def chunk_transcript(transcript: List[Dict], chunk_size: int = 500) -> List[str]:
+    words = []
+    chunks = []
+    for item in transcript:
+        words.extend(item["text"].split())
+        while len(words) >= chunk_size:
+            chunk_text = " ".join(words[:chunk_size])
+            chunks.append(chunk_text)
+            words = words[chunk_size:]
+    if words:
+        chunks.append(" ".join(words))
+    return chunks
+
 def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
     claims = []
-    full_text = " ".join([item["text"] for item in transcript])
-    if openai_client:
-        try:
-            resp = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """"You are a fact-checking assistant. Extract factual claims from the given transcript that can be verified. 
+    if not transcript:
+        return claims
+
+    chunks = chunk_transcript(transcript, chunk_size=400)  
+    for chunk in chunks:
+        if openai_client:
+            try:
+                resp = openai_client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system",
+                         "content": """"You are a fact-checking assistant. Extract factual claims from the given transcript that can be verified. 
 
                         Focus on:
                         - Specific statistics, numbers, or percentages
@@ -145,28 +161,28 @@ def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
                         ]
 
                         Limit to maximum 10 claims. Only return the JSON array, no other text.""",
-                    },
-                    {"role": "user", "content": full_text},
-                ],
-                temperature=0.3,
-                max_tokens=1000,
-            )
-            content = resp.choices[0].message.content.strip()
-            extracted = json.loads(content)
-            for c in extracted:
-                claim = Claim(
-                    text=c.get("text", ""),
-                    timestamp=c.get("timestamp", "0:00"),
-                    context=c.get("context", ""),
-                    factual_status="unverified",
-                    confidence_score=0.0,
-                    explanation="Pending fact-check",
+                        },
+                        {"role": "user", "content": chunk},
+                    ],
+                    temperature=0.3,
+                    max_tokens=1000,
                 )
-                claims.append(claim)
-        except Exception as e:
-            logger.error(f"OpenAI claim extraction failed: {e}")
+                content = resp.choices[0].message.content.strip()
+                extracted = json.loads(content)
+                for c in extracted:
+                    claim = Claim(
+                        text=c.get("text", ""),
+                        timestamp=c.get("timestamp", "0:00"),
+                        context=c.get("context", ""),
+                        factual_status="unverified",
+                        confidence_score=0.0,
+                        explanation="Pending fact-check",
+                    )
+                    claims.append(claim)
+            except Exception as e:
+                logger.error(f"OpenAI claim extraction failed for chunk: {e}")
 
-    # fallback sample claims
+    # fallback if no claims extracted
     if not claims:
         for statement in transcript:
             claims.append(
