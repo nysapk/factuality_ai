@@ -1,10 +1,12 @@
 import datetime
 import json
 import os
+import re
 import uuid
 from fastapi import FastAPI, APIRouter, HTTPException, logger
 from pathlib import Path
 from dotenv import load_dotenv
+import httpx
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
@@ -121,7 +123,25 @@ def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
                 messages=[
                     {
                         "role": "system",
-                        "content": "Extract up to 10 factual claims from the transcript in JSON format.",
+                        "content": """"You are a fact-checking assistant. Extract factual claims from the given transcript that can be verified. 
+
+                        Focus on:
+                        - Specific statistics, numbers, or percentages
+                        - Historical facts and dates
+                        - Scientific claims
+                        - Health claims
+                        - Current events
+
+                        Return a JSON array of claims with this structure:
+                        [
+                        {
+                            "text": "exact claim text",
+                            "timestamp": "estimated timestamp like 0:15", 
+                            "context": "brief context around the claim"
+                        }
+                        ]
+
+                        Limit to maximum 10 claims. Only return the JSON array, no other text.""",
                     },
                     {"role": "user", "content": full_text},
                 ],
@@ -175,100 +195,6 @@ async def search_wikipedia(query: str) -> List[str]:
     except Exception as e:
         logger.error(f"Wikipedia search failed for query '{query}': {str(e)}")
         return []
-
-def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
-    """Extract factual claims from transcript using OpenAI"""
-    claims = []
-    
-    # Combine transcript into text
-    full_text = " ".join([item["text"] for item in transcript])
-    
-    if openai_client:
-        try:
-            # Use OpenAI to extract claims
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": """You are a fact-checking assistant. Extract factual claims from the given transcript that can be verified. 
-
-                        Focus on:
-                        - Specific statistics, numbers, or percentages
-                        - Historical facts and dates
-                        - Scientific claims
-                        - Health claims
-                        - Current events
-
-                        Return a JSON array of claims with this structure:
-                        [
-                        {
-                            "text": "exact claim text",
-                            "timestamp": "estimated timestamp like 0:15", 
-                            "context": "brief context around the claim"
-                        }
-                        ]
-
-                        Limit to maximum 10 claims. Only return the JSON array, no other text."""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Extract verifiable factual claims from this transcript:\n\n{full_text}"
-                    }
-                ],
-                temperature=0.3,
-                max_tokens=1000
-            )
-            
-            claims_text = response.choices[0].message.content.strip()
-            
-            # Parse JSON response
-            try:
-                extracted_claims = json.loads(claims_text)
-                
-                for claim_data in extracted_claims:
-                    if isinstance(claim_data, dict):
-                        claim = Claim(
-                            text=claim_data.get("text", ""),
-                            timestamp=claim_data.get("timestamp", "0:00"),
-                            context=claim_data.get("context", ""),
-                            factual_status="unverified",
-                            confidence_score=0.0,
-                            explanation="Pending fact-check",
-                            sources=[]
-                        )
-                        claims.append(claim)
-                        
-            except json.JSONDecodeError:
-                logger.error("Failed to parse OpenAI response as JSON")
-                
-        except Exception as e:
-            logger.error(f"OpenAI claim extraction failed: {str(e)}")
-    
-    # Fallback to sample claims if OpenAI is not available or fails
-    if not claims:
-        logger.info("Using sample claims for demonstration")
-        factual_statements = [
-            {"text": "AI will replace 50% of all jobs by 2030", "timestamp": "0:15", "context": "Discussion about AI impact"},
-            {"text": "The moon landing in 1969 was a hoax staged by Hollywood", "timestamp": "0:45", "context": "Conspiracy theory discussion"},
-            {"text": "Drinking 8 glasses of water daily is essential for health", "timestamp": "1:18", "context": "Health advice segment"},
-            {"text": "Vaccines contain microchips for government surveillance", "timestamp": "1:52", "context": "Vaccine discussion"},
-            {"text": "Climate change is caused entirely by solar radiation", "timestamp": "2:36", "context": "Climate discussion"}
-        ]
-        
-        for statement in factual_statements:
-            claim = Claim(
-                text=statement["text"],
-                timestamp=statement["timestamp"],
-                context=statement["context"],
-                factual_status="unverified",
-                confidence_score=0.0,
-                explanation="Pending fact-check",
-                sources=[]
-            )
-            claims.append(claim)
-    
-    return claims
 
 async def search_wikipedia(query: str) -> List[str]:
     """Search Wikipedia for information related to a claim"""
@@ -407,3 +333,16 @@ async def fact_check_claim(claim: Claim) -> Claim:
         claim.sources = ["Wikipedia search yielded no relevant results"]
     
     return claim
+
+@api_router.post("/status", response_model=StatusCheck)
+async def create_status_check(input: StatusCheckCreate):
+    status_obj = StatusCheck(**input.dict())
+    await db.status_checks.insert_one(status_obj.dict())
+    return status_obj
+
+
+@api_router.get("/status", response_model=List[StatusCheck])
+async def get_status_checks():
+    checks = await db.status_checks.find().to_list(1000)
+    return [StatusCheck(**c) for c in checks]
+
