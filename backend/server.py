@@ -1,9 +1,12 @@
+import asyncio
 import datetime
 import json
 import os
 import re
 import uuid
 from fastapi import FastAPI, APIRouter, HTTPException, logger
+from starlette.middleware.cors import CORSMiddleware
+from motor.motor_asyncio import AsyncIOMotorClient
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
@@ -285,7 +288,7 @@ async def fact_check_claim(claim: Claim) -> Claim:
         except Exception as e:
             logger.error(f"OpenAI fact-checking failed: {str(e)}")
     
-    # Fallback to predefined fact-check results if OpenAI is not available
+    # fallback results if OpenAI is not available for testing purposes
     logger.info("Using fallback fact-checking for demonstration")
     
     fact_check_results = {
@@ -346,3 +349,47 @@ async def get_status_checks():
     checks = await db.status_checks.find().to_list(1000)
     return [StatusCheck(**c) for c in checks]
 
+@api_router.post("/fact-check/youtube", response_model=FactCheckResult)
+async def fact_check_youtube(request: YouTubeRequest):
+    start_time = asyncio.get_event_loop().time()
+    video_id = extract_youtube_video_id(request.url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
+
+    video_data = await get_youtube_transcript(video_id)
+    claims = extract_claims_from_transcript(video_data["transcript"])
+    fact_checked = [await fact_check_claim(c) for c in claims]
+
+    processing_time = asyncio.get_event_loop().time() - start_time
+    counts = {
+        "true": sum(c.factual_status == "true" for c in fact_checked),
+        "false": sum(c.factual_status == "false" for c in fact_checked),
+        "partial": sum(c.factual_status == "partial" for c in fact_checked),
+        "unverified": sum(c.factual_status == "unverified" for c in fact_checked),
+    }
+
+    result = FactCheckResult(
+        youtube_url=request.url,
+        video_title=video_data["title"],
+        channel_name=video_data["channel"],
+        transcript_length=len(video_data["transcript"]),
+        claims=fact_checked,
+        processing_time=processing_time,
+        total_claims=len(fact_checked),
+        true_claims=counts["true"],
+        false_claims=counts["false"],
+        partial_claims=counts["partial"],
+        unverified_claims=counts["unverified"],
+    )
+
+    await db.fact_checks.insert_one(result.dict())
+    return result
+
+app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
