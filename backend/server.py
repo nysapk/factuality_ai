@@ -1,5 +1,5 @@
 import asyncio
-import datetime
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -13,7 +13,7 @@ import httpx
 from motor.motor_asyncio import AsyncIOMotorClient
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, Field
-from youtube_transcript_api import YouTubeTranscriptApi
+from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 import wikipediaapi
 from openai import OpenAI
 
@@ -22,9 +22,12 @@ load_dotenv(ROOT_DIR / '.env')
 
 
 # MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# mongo_url = os.environ['MONGO_URL']
+# client = AsyncIOMotorClient(mongo_url)
+# db = client[os.environ['DB_NAME']]
+
+status_checks_store = []
+fact_checks_store = []
 
 # Initialize APIs
 openai_client = None
@@ -48,7 +51,7 @@ api_router = APIRouter(prefix="/api")
 class StatusCheck(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     client_name: str
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 class StatusCheckCreate(BaseModel):
     client_name: str
@@ -74,7 +77,7 @@ class FactCheckResult(BaseModel):
     transcript_length: int
     claims: List[Claim]
     processing_time: float
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     total_claims: int
     true_claims: int
     false_claims: int
@@ -94,7 +97,7 @@ def extract_youtube_video_id(url: str) -> Optional[str]:
 
 async def get_youtube_transcript(video_id: str) -> Dict[str, Any]:
     try:
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id)
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id).find_transcript(['en']).fetch()
         # Get video metadata using oEmbed
         async with httpx.AsyncClient() as client:
             oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
@@ -107,14 +110,10 @@ async def get_youtube_transcript(video_id: str) -> Dict[str, Any]:
                 title = f"Video {video_id}"
                 channel = "Unknown Channel"
         return {"title": title, "channel": channel, "transcript": transcript_list}
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        raise HTTPException(status_code=404, detail=f"No transcript found: {str(e)}")
     except Exception as e:
-        logger.warning(f"Could not fetch transcript: {e}")
-        # Return demo transcript if fails
-        demo_transcript = [
-            {"text": "AI will replace 50% of all jobs by 2030", "start": 15.2},
-            {"text": "The moon landing in 1969 was a hoax staged by Hollywood", "start": 45.8},
-        ]
-        return {"title": "Demo Video", "channel": "Demo Channel", "transcript": demo_transcript}
+        raise HTTPException(status_code=500, detail=f"Transcript fetch error: {str(e)}")
 
 def chunk_transcript(transcript: List[Dict], chunk_size: int = 500) -> List[str]:
     words = []
@@ -356,14 +355,25 @@ async def fact_check_claim(claim: Claim) -> Claim:
 @api_router.post("/status", response_model=StatusCheck)
 async def create_status_check(input: StatusCheckCreate):
     status_obj = StatusCheck(**input.dict())
-    await db.status_checks.insert_one(status_obj.dict())
+    status_checks_store.append(status_obj.dict()) 
     return status_obj
 
 
 @api_router.get("/status", response_model=List[StatusCheck])
 async def get_status_checks():
-    checks = await db.status_checks.find().to_list(1000)
-    return [StatusCheck(**c) for c in checks]
+    return [StatusCheck(**c) for c in status_checks_store]
+
+# @api_router.post("/status", response_model=StatusCheck)
+# async def create_status_check(input: StatusCheckCreate):
+#     status_obj = StatusCheck(**input.dict())
+#     await db.status_checks.insert_one(status_obj.dict())
+#     return status_obj
+
+
+# @api_router.get("/status", response_model=List[StatusCheck])
+# async def get_status_checks():
+#     checks = await db.status_checks.find().to_list(1000)
+#     return [StatusCheck(**c) for c in checks]
 
 @api_router.post("/fact-check/youtube", response_model=FactCheckResult)
 async def fact_check_youtube(request: YouTubeRequest):
@@ -398,12 +408,14 @@ async def fact_check_youtube(request: YouTubeRequest):
         unverified_claims=counts["unverified"],
     )
 
-    await db.fact_checks.insert_one(result.dict())
+    # await db.fact_checks.insert_one(result.dict())
+    fact_checks_store.append(result.dict())
     return result
 
 @api_router.get("/fact-check/outrageous-claims")
 async def get_outrageous_claims():
-    claims = await db.fact_checks.find().to_list(100)
+    # claims = await db.fact_checks.find().to_list(100)
+    claims = fact_checks_store
     outrageous = []
     for fc in claims:
         for claim in fc["claims"]:
