@@ -113,7 +113,8 @@ def extract_youtube_video_id(url: str):
 
 async def get_youtube_transcript(video_id: str):
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+        ytt_api = YouTubeTranscriptApi()
+        transcript = ytt_api.fetch(video_id).to_raw_data()
 
         async with httpx.AsyncClient() as client:
             info = await client.get(
@@ -125,11 +126,11 @@ async def get_youtube_transcript(video_id: str):
         return {
             "title": meta.get("title", "Unknown"),
             "channel": meta.get("author_name", "Unknown"),
-            "transcript": transcript
+            "transcript": transcript,
         }
 
-    except (TranscriptsDisabled, NoTranscriptFound):
-        raise HTTPException(status_code=404, detail="Transcript not available")
+    except (TranscriptsDisabled, NoTranscriptFound) as e:
+        raise HTTPException(status_code=404, detail=f"Transcript not available: {e}")
 
 
 # extracting claims
