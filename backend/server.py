@@ -4,70 +4,68 @@ import json
 import os
 import re
 import uuid
-from fastapi import FastAPI, APIRouter, HTTPException, logger
-from starlette.middleware.cors import CORSMiddleware
-from motor.motor_asyncio import AsyncIOMotorClient
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import Any, Dict, List, Optional
+
 import httpx
-from motor.motor_asyncio import AsyncIOMotorClient
-from typing import List, Optional, Dict, Any
-from pydantic import BaseModel, Field
-from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 import wikipediaapi
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, HTTPException
 from openai import OpenAI
+from pydantic import BaseModel, Field
+from starlette.middleware.cors import CORSMiddleware
+from youtube_transcript_api import NoTranscriptFound, TranscriptsDisabled, YouTubeTranscriptApi
 
+from db import fact_checks_collection, status_checks_collection
+
+
+# env
 ROOT_DIR = Path(__file__).parent
-load_dotenv(ROOT_DIR / '.env')
+load_dotenv(ROOT_DIR / ".env")
 
-
-# MongoDB connection
-# mongo_url = os.environ['MONGO_URL']
-# client = AsyncIOMotorClient(mongo_url)
-# db = client[os.environ['DB_NAME']]
-
-status_checks_store = []
-fact_checks_store = []
-
-# Initialize APIs
 openai_client = None
-openai_api_key = os.environ.get('OPENAI_API_KEY')
-if openai_api_key and openai_api_key != "your_openai_api_key_here":
-    openai_client = OpenAI(api_key=openai_api_key)
+api_key = os.environ.get("OPENAI_API_KEY")
+
+if api_key and api_key != "your_openai_api_key_here":
+    openai_client = OpenAI(api_key=api_key)
+
 
 wiki_wiki = wikipediaapi.Wikipedia(
-    language='en',
+    language="en",
     extract_format=wikipediaapi.ExtractFormat.WIKI,
-    user_agent='Factuality/1.0 (https://github.com/your-repo) Fact-checking bot'
+    user_agent="factuality-ai"
 )
 
-# Create the main app 
-app = FastAPI(title="Factuality - Real-time Fact Checker")
-
-# Create a router with the /api prefix
+app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Define Models
+
+# models
+
 class StatusCheck(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     client_name: str
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
+
 class StatusCheckCreate(BaseModel):
     client_name: str
 
+
 class YouTubeRequest(BaseModel):
     url: str
+
 
 class Claim(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
     text: str
     timestamp: str
     context: str
-    factual_status: str  # "true", "false", "partial", "unverified"
+    factual_status: str
     confidence_score: float
     explanation: str
     sources: List[str] = []
+
 
 class FactCheckResult(BaseModel):
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
@@ -84,344 +82,189 @@ class FactCheckResult(BaseModel):
     partial_claims: int
     unverified_claims: int
 
-def extract_youtube_video_id(url: str) -> Optional[str]:
-    patterns = [
-        r"(?:youtube\.com/watch\?v=|youtu\.be/)([a-zA-Z0-9_-]+)",
-        r"youtube\.com/embed/([a-zA-Z0-9_-]+)",
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, url)
-        if match:
-            return match.group(1)
-    return None
 
-async def get_youtube_transcript(video_id: str) -> Dict[str, Any]:
+# helpers
+
+def clean_mongo_doc(doc):
+    if not doc:
+        return doc
+    doc.pop("_id", None)
+    return doc
+
+
+def clean_mongo_docs(docs):
+    return [clean_mongo_doc(doc) for doc in docs]
+
+
+@app.on_event("startup")
+async def startup():
+    await fact_checks_collection.create_index("id", unique=True)
+    await fact_checks_collection.create_index("created_at")
+    await fact_checks_collection.create_index("youtube_url")
+    await status_checks_collection.create_index("id", unique=True)
+
+
+def extract_youtube_video_id(url: str):
+    match = re.search(r"(?:v=|youtu\.be/)([a-zA-Z0-9_-]+)", url)
+    return match.group(1) if match else None
+
+
+# transcript
+
+async def get_youtube_transcript(video_id: str):
     try:
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id).find_transcript(['en']).fetch()
-        # Get video metadata using oEmbed
+        transcript = YouTubeTranscriptApi.get_transcript(video_id)
+
         async with httpx.AsyncClient() as client:
-            oembed_url = f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
-            resp = await client.get(oembed_url)
-            if resp.status_code == 200:
-                info = resp.json()
-                title = info.get("title", f"Video {video_id}")
-                channel = info.get("author_name", "Unknown Channel")
-            else:
-                title = f"Video {video_id}"
-                channel = "Unknown Channel"
-        return {"title": title, "channel": channel, "transcript": transcript_list}
-    except (TranscriptsDisabled, NoTranscriptFound) as e:
-        raise HTTPException(status_code=404, detail=f"No transcript found: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Transcript fetch error: {str(e)}")
-
-def chunk_transcript(transcript: List[Dict], chunk_size: int = 500) -> List[str]:
-    words = []
-    chunks = []
-    for item in transcript:
-        words.extend(item["text"].split())
-        while len(words) >= chunk_size:
-            chunk_text = " ".join(words[:chunk_size])
-            chunks.append(chunk_text)
-            words = words[chunk_size:]
-    if words:
-        chunks.append(" ".join(words))
-    return chunks
-
-def extract_claims_from_transcript(transcript: List[Dict]) -> List[Claim]:
-    claims = []
-    if not transcript:
-        return claims
-
-    chunks = chunk_transcript(transcript, chunk_size=400)  
-    for chunk in chunks:
-        if openai_client:
-            try:
-                resp = openai_client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[
-                        {"role": "system",
-                         "content": """"You are a fact-checking assistant. Extract factual claims from the given transcript that can be verified. 
-
-                        Focus on:
-                        - Specific statistics, numbers, or percentages
-                        - Historical facts and dates
-                        - Scientific claims
-                        - Health claims
-                        - Current events
-
-                        Return a JSON array of claims with this structure:
-                        [
-                        {
-                            "text": "exact claim text",
-                            "timestamp": "estimated timestamp like 0:15", 
-                            "context": "brief context around the claim"
-                        }
-                        ]
-
-                        Limit to maximum 10 claims. Only return the JSON array, no other text.""",
-                        },
-                        {"role": "user", "content": chunk},
-                    ],
-                    temperature=0.3,
-                    max_tokens=1000,
-                )
-                content = resp.choices[0].message.content.strip()
-                extracted = json.loads(content)
-                for c in extracted:
-                    claim = Claim(
-                        text=c.get("text", ""),
-                        timestamp=c.get("timestamp", "0:00"),
-                        context=c.get("context", ""),
-                        factual_status="unverified",
-                        confidence_score=0.0,
-                        explanation="Pending fact-check",
-                    )
-                    claims.append(claim)
-            except Exception as e:
-                logger.error(f"OpenAI claim extraction failed for chunk: {e}")
-
-    # fallback if no claims extracted
-    if not claims:
-        for statement in transcript:
-            claims.append(
-                Claim(
-                    text=statement["text"],
-                    timestamp=str(statement.get("start", 0)),
-                    context="",
-                    factual_status="unverified",
-                    confidence_score=0.0,
-                    explanation="Pending fact-check",
-                )
+            info = await client.get(
+                f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={video_id}&format=json"
             )
+
+        meta = info.json() if info.status_code == 200 else {}
+
+        return {
+            "title": meta.get("title", "Unknown"),
+            "channel": meta.get("author_name", "Unknown"),
+            "transcript": transcript
+        }
+
+    except (TranscriptsDisabled, NoTranscriptFound):
+        raise HTTPException(status_code=404, detail="Transcript not available")
+
+
+# extracting claims
+
+def chunk_transcript(transcript, chunk_size=400):
+    words = []
+    for t in transcript:
+        words.extend(t["text"].split())
+
+    return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
+
+
+def extract_claims(transcript):
+    claims = []
+
+    for chunk in chunk_transcript(transcript):
+        if not openai_client:
+            continue
+
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "Extract factual claims as JSON array"},
+                {"role": "user", "content": chunk}
+            ]
+        )
+
+        try:
+            parsed = json.loads(response.choices[0].message.content)
+            for c in parsed:
+                claims.append(Claim(
+                    text=c["text"],
+                    timestamp=c.get("timestamp", "0:00"),
+                    context=c.get("context", ""),
+                    factual_status="unverified",
+                    confidence_score=0,
+                    explanation=""
+                ))
+        except:
+            pass
+
     return claims
 
-async def search_wikipedia(query: str) -> List[str]:
-    """Search Wikipedia for information related to a claim"""
-    try:
-        # Search for relevant Wikipedia pages
-        page = wiki_wiki.page(query)
-        sources = []
-        
-        if page.exists():
-            sources.append(page.fullurl)
-            # Add summary if available
-            if hasattr(page, 'summary') and page.summary:
-                sources.append(f"Wikipedia Summary: {page.summary[:200]}...")
-        
-        return sources
-    except Exception as e:
-        logger.error(f"Wikipedia search failed for query '{query}': {str(e)}")
-        return []
 
-async def search_wikipedia(query: str) -> List[str]:
-    """Search Wikipedia for information related to a claim"""
-    try:
-        # Search for relevant Wikipedia pages
-        page = wiki_wiki.page(query)
-        sources = []
-        
-        if page.exists():
-            sources.append(page.fullurl)
-            # Add summary if available
-            if hasattr(page, 'summary') and page.summary:
-                sources.append(f"Wikipedia Summary: {page.summary[:200]}...")
-        
-        return sources
-    except Exception as e:
-        logger.error(f"Wikipedia search failed for query '{query}': {str(e)}")
-        return []
+# fact checking claims
 
-async def fact_check_claim(claim: Claim) -> Claim:
-    """Fact-check a claim against Wikipedia and using OpenAI"""
-    
-    # Search Wikipedia for relevant information
-    wikipedia_sources = await search_wikipedia(claim.text)
-    
-    if openai_client:
-        try:
-            # Prepare context from Wikipedia if available
-            wikipedia_context = ""
-            if wikipedia_sources:
-                wikipedia_context = f"\n\nRelevant Wikipedia information:\n{'; '.join(wikipedia_sources)}"
-            
-            # Use OpenAI to fact-check the claim
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {
-                        "role": "system", 
-                        "content": """You are a professional fact-checker. Analyze the given claim and provide a factual assessment.
+async def fact_check_claim(claim: Claim):
+    if not openai_client:
+        return claim
 
-                            Categorize claims as:
-                            - "true": Factually accurate and well-supported
-                            - "false": Factually incorrect or debunked
-                            - "partial": Contains some truth but is misleading or oversimplified
-                            - "unverified": Cannot be reliably verified with current information
-
-                            Provide:
-                            1. A clear factual_status (true/false/partial/unverified)
-                            2. A confidence_score between 0.0-1.0
-                            3. A clear explanation of your reasoning
-                            4. Relevant sources when possible
-
-                            Return ONLY a JSON object in this format:
-                            {
-                            "factual_status": "true|false|partial|unverified",
-                            "confidence_score": 0.85,
-                            "explanation": "Clear explanation of the fact-check result"
-                            }"""
-                    },
-                    {
-                        "role": "user",
-                        "content": f"Fact-check this claim: '{claim.text}'{wikipedia_context}"
-                    }
-                ],
-                temperature=0.2,
-                max_tokens=500
-            )
-            
-            fact_check_text = response.choices[0].message.content.strip()
-            
-            # Parse JSON response
-            try:
-                fact_check_result = json.loads(fact_check_text)
-                
-                claim.factual_status = fact_check_result.get("factual_status", "unverified")
-                claim.confidence_score = float(fact_check_result.get("confidence_score", 0.5))
-                claim.explanation = fact_check_result.get("explanation", "Fact-check completed")
-                
-                # Add Wikipedia sources if found
-                if wikipedia_sources:
-                    claim.sources.extend(wikipedia_sources)
-                
-                return claim
-                
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f"Failed to parse OpenAI fact-check response: {str(e)}")
-                
-        except Exception as e:
-            logger.error(f"OpenAI fact-checking failed: {str(e)}")
-    
-    # fallback results if OpenAI is not available for testing purposes
-    logger.info("Using fallback fact-checking for demonstration")
-    
-    fact_check_results = {
-        "AI will replace 50% of all jobs by 2030": {
-            "status": "partial",
-            "confidence": 0.6,
-            "explanation": "While AI will impact many jobs, the 50% figure lacks consensus. Studies range from 9% to 47% depending on methodology and timeframe.",
-        },
-        "The moon landing in 1969 was a hoax staged by Hollywood": {
-            "status": "false", 
-            "confidence": 0.95,
-            "explanation": "The Apollo 11 moon landing is well-documented with extensive evidence including retroreflectors, moon rocks, and independent verification from multiple countries including rivals.",
-        },
-        "Drinking 8 glasses of water daily is essential for health": {
-            "status": "partial",
-            "confidence": 0.4,
-            "explanation": "The '8 glasses a day' rule is not scientifically established. Water needs vary by individual, activity, climate, and overall health.",
-        },
-        "Vaccines contain microchips for government surveillance": {
-            "status": "false",
-            "confidence": 0.98, 
-            "explanation": "This is a debunked conspiracy theory. Vaccines contain biological components and adjuvants, but no electronic devices. Microchips would be visible in medical imaging.",
-        },
-        "Climate change is caused entirely by solar radiation": {
-            "status": "false",
-            "confidence": 0.92,
-            "explanation": "While solar variations affect climate, scientific consensus attributes current climate change primarily to human greenhouse gas emissions, not solar activity.",
-        }
-    }
-    
-    result = fact_check_results.get(claim.text, {
-        "status": "unverified",
-        "confidence": 0.1,
-        "explanation": "Unable to verify this claim with available sources.",
-    })
-    
-    claim.factual_status = result["status"]
-    claim.confidence_score = result["confidence"] 
-    claim.explanation = result["explanation"]
-    
-    # Add Wikipedia sources if found
-    if wikipedia_sources:
-        claim.sources.extend(wikipedia_sources)
-    else:
-        claim.sources = ["Wikipedia search yielded no relevant results"]
-    
-    return claim
-
-@api_router.post("/status", response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_obj = StatusCheck(**input.dict())
-    status_checks_store.append(status_obj.dict()) 
-    return status_obj
-
-
-@api_router.get("/status", response_model=List[StatusCheck])
-async def get_status_checks():
-    return [StatusCheck(**c) for c in status_checks_store]
-
-# @api_router.post("/status", response_model=StatusCheck)
-# async def create_status_check(input: StatusCheckCreate):
-#     status_obj = StatusCheck(**input.dict())
-#     await db.status_checks.insert_one(status_obj.dict())
-#     return status_obj
-
-
-# @api_router.get("/status", response_model=List[StatusCheck])
-# async def get_status_checks():
-#     checks = await db.status_checks.find().to_list(1000)
-#     return [StatusCheck(**c) for c in checks]
-
-@api_router.post("/fact-check/youtube", response_model=FactCheckResult)
-async def fact_check_youtube(request: YouTubeRequest):
-    start_time = asyncio.get_event_loop().time()
-    video_id = extract_youtube_video_id(request.url)
-    if not video_id:
-        raise HTTPException(status_code=400, detail="Invalid YouTube URL")
-
-    video_data = await get_youtube_transcript(video_id)
-    claims = extract_claims_from_transcript(video_data["transcript"])
-    fact_checked = [await fact_check_claim(c) for c in claims]
-
-    processing_time = asyncio.get_event_loop().time() - start_time
-    counts = {
-        "true": sum(c.factual_status == "true" for c in fact_checked),
-        "false": sum(c.factual_status == "false" for c in fact_checked),
-        "partial": sum(c.factual_status == "partial" for c in fact_checked),
-        "unverified": sum(c.factual_status == "unverified" for c in fact_checked),
-    }
-
-    result = FactCheckResult(
-        youtube_url=request.url,
-        video_title=video_data["title"],
-        channel_name=video_data["channel"],
-        transcript_length=len(video_data["transcript"]),
-        claims=fact_checked,
-        processing_time=processing_time,
-        total_claims=len(fact_checked),
-        true_claims=counts["true"],
-        false_claims=counts["false"],
-        partial_claims=counts["partial"],
-        unverified_claims=counts["unverified"],
+    response = openai_client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "Fact check this claim and return JSON"},
+            {"role": "user", "content": claim.text}
+        ]
     )
 
-    # await db.fact_checks.insert_one(result.dict())
-    fact_checks_store.append(result.dict())
+    try:
+        result = json.loads(response.choices[0].message.content)
+        claim.factual_status = result.get("factual_status", "unverified")
+        claim.confidence_score = result.get("confidence_score", 0)
+        claim.explanation = result.get("explanation", "")
+    except:
+        pass
+
+    return claim
+
+
+# routes
+
+@api_router.post("/status")
+async def create_status(input: StatusCheckCreate):
+    obj = StatusCheck(**input.dict())
+    await status_checks_collection.insert_one(obj.model_dump(mode="json"))
+    return obj
+
+
+@api_router.get("/status")
+async def get_status():
+    docs = await status_checks_collection.find().to_list(100)
+    return clean_mongo_docs(docs)
+
+
+@api_router.post("/fact-check/youtube")
+async def fact_check(req: YouTubeRequest):
+    start = asyncio.get_event_loop().time()
+
+    video_id = extract_youtube_video_id(req.url)
+    if not video_id:
+        raise HTTPException(status_code=400, detail="Invalid URL")
+
+    data = await get_youtube_transcript(video_id)
+
+    claims = extract_claims(data["transcript"])
+    checked = [await fact_check_claim(c) for c in claims]
+
+    result = FactCheckResult(
+        youtube_url=req.url,
+        video_title=data["title"],
+        channel_name=data["channel"],
+        transcript_length=len(data["transcript"]),
+        claims=checked,
+        processing_time=asyncio.get_event_loop().time() - start,
+        total_claims=len(checked),
+        true_claims=sum(c.factual_status == "true" for c in checked),
+        false_claims=sum(c.factual_status == "false" for c in checked),
+        partial_claims=sum(c.factual_status == "partial" for c in checked),
+        unverified_claims=sum(c.factual_status == "unverified" for c in checked),
+    )
+
+    await fact_checks_collection.insert_one(result.model_dump(mode="json"))
+
     return result
 
+
 @api_router.get("/fact-check/outrageous-claims")
-async def get_outrageous_claims():
-    # claims = await db.fact_checks.find().to_list(100)
-    claims = fact_checks_store
-    outrageous = []
-    for fc in claims:
+async def outrageous():
+    docs = await fact_checks_collection.find().sort("created_at", -1).to_list(100)
+
+    docs = clean_mongo_docs(docs)
+
+    results = []
+    for fc in docs:
         for claim in fc["claims"]:
             if claim["confidence_score"] < 0.3 or claim["factual_status"] == "false":
-                outrageous.append({"video_title": fc["video_title"], "channel_name": fc["channel_name"], "claim": claim, "created_at": fc["created_at"]})
-    return outrageous
+                results.append({
+                    "video_title": fc["video_title"],
+                    "claim": claim
+                })
+
+    return results
+
+
+# app
 
 app.include_router(api_router)
 
