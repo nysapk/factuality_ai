@@ -163,9 +163,6 @@ const OutrageousClaims = () => {
             </div>
             <blockquote className="font-medium text-gray-900 mb-2">"{item.claim.text}"</blockquote>
             <p className="text-sm text-gray-700">{item.claim.explanation}</p>
-            <div className="mt-2 text-xs text-gray-500">
-              Analyzed on {new Date(item.created_at).toLocaleDateString()}
-            </div>
           </div>
         ))}
       </div>

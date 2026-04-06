@@ -143,61 +143,205 @@ def chunk_transcript(transcript, chunk_size=400):
     return [" ".join(words[i:i+chunk_size]) for i in range(0, len(words), chunk_size)]
 
 
+def parse_json_maybe_wrapped(text: str):
+    text = text.strip()
+
+    if text.startswith("```"):
+        lines = text.splitlines()
+        if lines and lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
+
+    return json.loads(text)
+
+
 def extract_claims(transcript):
     claims = []
 
-    for chunk in chunk_transcript(transcript):
-        if not openai_client:
-            continue
+    if not transcript:
+        return claims
 
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "Extract factual claims as JSON array"},
-                {"role": "user", "content": chunk}
-            ]
-        )
+    if not openai_client:
+        # fallback mode if no OpenAI key
+        for item in transcript:
+            text = item.get("text", "").strip()
+            if not text:
+                continue
 
+            has_number = any(ch.isdigit() for ch in text)
+            long_enough = len(text.split()) >= 8
+
+            if has_number or long_enough:
+                start_seconds = int(item.get("start", 0))
+                minutes = start_seconds // 60
+                seconds = start_seconds % 60
+
+                claims.append(
+                    Claim(
+                        text=text,
+                        timestamp=f"{minutes}:{seconds:02d}",
+                        context="Fallback extraction without OpenAI",
+                        factual_status="unverified",
+                        confidence_score=0.0,
+                        explanation="Extracted without OpenAI; not yet fact-checked",
+                        sources=[],
+                    )
+                )
+
+            if len(claims) >= 15:
+                break
+
+        return claims
+
+    chunks = chunk_transcript(transcript, chunk_size=350)
+
+    for i, chunk in enumerate(chunks):
         try:
-            parsed = json.loads(response.choices[0].message.content)
-            for c in parsed:
-                claims.append(Claim(
-                    text=c["text"],
-                    timestamp=c.get("timestamp", "0:00"),
-                    context=c.get("context", ""),
-                    factual_status="unverified",
-                    confidence_score=0,
-                    explanation=""
-                ))
-        except:
-            pass
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": """You extract factual claims from transcripts.
 
-    return claims
+                    Return ONLY a valid JSON array.
+                    Each item must be an object with:
+                    - text
+                    - timestamp
+                    - context
+
+                    Rules:
+                    - Include only specific, checkable factual claims
+                    - Do not include opinions, jokes, rhetorical questions, or vague statements
+                    - Keep the claim text concise but faithful
+                    - Return at most 8 claims
+
+                    Example:
+                    [
+                    {
+                        "text": "Humans spend about one-third of their lives asleep.",
+                        "timestamp": "0:15",
+                        "context": "Speaker explains how much time humans spend sleeping."
+                    }
+                    ]"""
+                    },
+                    {"role": "user", "content": chunk},
+                ],
+                temperature=0.1,
+                max_tokens=1200,
+            )
+
+            raw = response.choices[0].message.content or ""
+            print(f"\n--- RAW CLAIM OUTPUT chunk {i} ---\n{raw}\n")
+
+            parsed = parse_json_maybe_wrapped(raw)
+
+            if not isinstance(parsed, list):
+                print(f"Chunk {i}: parsed output is not a list")
+                continue
+
+            for c in parsed:
+                text = (c.get("text") or "").strip()
+                if not text:
+                    continue
+
+                claims.append(
+                    Claim(
+                        text=text,
+                        timestamp=c.get("timestamp", "0:00"),
+                        context=c.get("context", ""),
+                        factual_status="unverified",
+                        confidence_score=0.0,
+                        explanation="Pending fact-check",
+                        sources=[],
+                    )
+                )
+
+        except Exception as e:
+            print(f"CLAIM EXTRACTION ERROR on chunk {i}: {e}")
+
+    # dedupe
+    deduped = []
+    seen = set()
+    for claim in claims:
+        key = claim.text.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(claim)
+
+    return deduped[:20]
+
+async def search_wikipedia(query: str):
+    try:
+        page = wiki_wiki.page(query)
+        sources = []
+
+        if page.exists():
+            sources.append(page.fullurl)
+
+            if hasattr(page, "summary") and page.summary:
+                sources.append(f"Wikipedia Summary: {page.summary[:200]}...")
+
+        return sources
+
+    except Exception as e:
+        print(f"Wikipedia search failed: {e}")
+        return []
 
 
 # fact checking claims
 
 async def fact_check_claim(claim: Claim):
+    wikipedia_sources = await search_wikipedia(claim.text)
+
     if not openai_client:
+        claim.factual_status = "unverified"
+        claim.confidence_score = 0.1
+        claim.explanation = "No valid OpenAI API key configured."
+        claim.sources = wikipedia_sources if wikipedia_sources else []
         return claim
 
-    response = openai_client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {"role": "system", "content": "Fact check this claim and return JSON"},
-            {"role": "user", "content": claim.text}
-        ]
-    )
-
     try:
-        result = json.loads(response.choices[0].message.content)
-        claim.factual_status = result.get("factual_status", "unverified")
-        claim.confidence_score = result.get("confidence_score", 0)
-        claim.explanation = result.get("explanation", "")
-    except:
-        pass
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": """You are a professional fact-checker.
 
-    return claim
+                    Return ONLY a valid JSON object:
+                    {
+                    "factual_status": "true|false|partial|unverified",
+                    "confidence_score": 0.0,
+                    "explanation": "brief explanation"
+                    }"""
+                },
+                {"role": "user", "content": claim.text},
+            ],
+            temperature=0.1,
+            max_tokens=500,
+        )
+
+        raw = response.choices[0].message.content or ""
+        print(f"\n--- RAW FACT CHECK OUTPUT ---\n{raw}\n")
+
+        result = parse_json_maybe_wrapped(raw)
+
+        claim.factual_status = result.get("factual_status", "unverified")
+        claim.confidence_score = float(result.get("confidence_score", 0.0))
+        claim.explanation = result.get("explanation", "")
+        claim.sources = wikipedia_sources if wikipedia_sources else []
+        return claim
+
+    except Exception as e:
+        print(f"FACT CHECK ERROR: {e}")
+        claim.factual_status = "unverified"
+        claim.confidence_score = 0.1
+        claim.explanation = f"Fact-check failed: {e}"
+        claim.sources = wikipedia_sources if wikipedia_sources else []
+        return claim
 
 
 # routes
